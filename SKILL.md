@@ -1,6 +1,6 @@
 ---
 name: codex-account-switcher
-version: 1.1.1
+version: 1.1.2
 description: >
   Manage multiple OpenAI Codex accounts. Capture current login tokens and switch
   between them instantly. ⚠️ Reads and writes ~/.codex/auth.json and
