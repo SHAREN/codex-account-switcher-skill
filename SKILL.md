@@ -1,9 +1,16 @@
 ---
 name: codex-account-switcher
-description: Manage multiple OpenAI Codex accounts. Capture current login tokens and switch between them instantly.
+version: 1.1.1
+description: >
+  Manage multiple OpenAI Codex accounts. Capture current login tokens and switch
+  between them instantly. ⚠️ Reads and writes ~/.codex/auth.json and
+  ~/.codex/accounts/*.json (sensitive authentication tokens).
 metadata:
   moltbot:
     emoji: "🎭"
+    requires:
+      bins: ["python3"]
+  openclaw:
     requires:
       bins: ["python3"]
 ---
