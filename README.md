@@ -19,6 +19,12 @@ See [SKILL.md](SKILL.md) for full documentation.
 ./codex-accounts.py auto          # Switch to account with best quota
 ```
 
+## Documentation
+
+- [SKILL.md](SKILL.md) — agent-facing reference (commands, behavior, limitations)
+- [SETUP.md](SETUP.md) — prerequisites, configuration, and setup instructions
+- [ClawHub](https://www.clawhub.com/skills/codex-account-switcher) — install via ClawHub registry
+
 ## License
 
 MIT
