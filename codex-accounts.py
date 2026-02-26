@@ -565,7 +565,7 @@ def _get_quota_for_account(name):
     # Ping codex to get fresh session
     try:
         subprocess.run(
-            ["codex", "-p", "PING"],
+            ["codex", "exec", "PING"],
             capture_output=True,
             timeout=30
         )
