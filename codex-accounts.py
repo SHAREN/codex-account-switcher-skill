@@ -546,73 +546,122 @@ def _load_quota_cache(name, max_age_hours=24):
         pass
     return None
 
+def _extract_rate_limits_from_event(event):
+    """Extract rate_limits from different Codex session event shapes."""
+    if not isinstance(event, dict):
+        return None
+
+    # Most common shape: {"type":"event_msg", "payload":{"type":"token_count", "rate_limits": {...}}}
+    payload = event.get('payload')
+    if isinstance(payload, dict):
+        if payload.get('type') == 'token_count' and isinstance(payload.get('rate_limits'), dict):
+            return payload['rate_limits']
+
+    # Fallback shape: {"type":"token_count", "rate_limits": {...}}
+    if event.get('type') == 'token_count' and isinstance(event.get('rate_limits'), dict):
+        return event['rate_limits']
+
+    return None
+
+
 def _get_quota_for_account(name):
     """Get quota info for an account by switching to it and pinging Codex."""
     import subprocess
     import time
     from datetime import datetime
-    
+
     source = ACCOUNTS_DIR / f"{name}.json"
     if not source.exists():
         return None
-    
+
     # Switch to account
     shutil.copy(source, AUTH_FILE)
-    
-    # Record time before ping to only look at sessions created after
+
+    sessions_dir = CODEX_DIR / "sessions"
+
+    # Snapshot known session files before ping (more robust than strict mtime only)
+    known_files = set()
+    if sessions_dir.exists():
+        known_files = {str(f) for f in sessions_dir.glob('*/*/*/*.jsonl')}
+
     before_ping = time.time()
-    
-    # Ping codex to get fresh session
+
+    # Ping codex to force fresh token_count/rate_limits into session log
     try:
         subprocess.run(
-            ["codex", "-p", "PING"],
+            ["codex", "exec", "PING"],
             capture_output=True,
-            timeout=30
+            timeout=45
         )
     except Exception:
         pass
-    
-    time.sleep(0.5)
-    
-    # Find sessions created AFTER our ping and extract rate limits
-    sessions_dir = CODEX_DIR / "sessions"
-    now = datetime.now()
-    
-    for day_offset in range(2):
-        date = datetime.fromordinal(now.toordinal() - day_offset)
-        day_dir = sessions_dir / f"{date.year:04d}" / f"{date.month:02d}" / f"{date.day:02d}"
-        
-        if not day_dir.exists():
-            continue
-        
-        # Only consider sessions created after our ping
-        jsonl_files = [f for f in day_dir.glob("*.jsonl") if f.stat().st_mtime > before_ping]
-        if not jsonl_files:
-            continue
-            
-        # Check each new session for rate_limits
-        for session_file in sorted(jsonl_files, key=lambda f: f.stat().st_mtime, reverse=True):
+
+    time.sleep(0.8)
+
+    # Candidate files: newly created files first, then recently touched files
+    candidates = []
+    if sessions_dir.exists():
+        all_files = list(sessions_dir.glob('*/*/*/*.jsonl'))
+        new_files = [f for f in all_files if str(f) not in known_files]
+        recent_files = [f for f in all_files if f.stat().st_mtime >= (before_ping - 2)]
+
+        # Preserve order by recency, avoid duplicates
+        seen = set()
+        for f in sorted(new_files + recent_files, key=lambda x: x.stat().st_mtime, reverse=True):
+            key = str(f)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(f)
+
+    # Fallback to today's/yesterday's logs if candidate detection missed
+    if not candidates:
+        now = datetime.now()
+        for day_offset in range(2):
+            date = datetime.fromordinal(now.toordinal() - day_offset)
+            day_dir = sessions_dir / f"{date.year:04d}" / f"{date.month:02d}" / f"{date.day:02d}"
+            if not day_dir.exists():
+                continue
+            candidates.extend(sorted(day_dir.glob('*.jsonl'), key=lambda f: f.stat().st_mtime, reverse=True))
+
+    for session_file in candidates:
+        try:
             with open(session_file, 'r') as f:
                 lines = f.readlines()
-            
-            for line in reversed(lines):
-                if not line.strip():
-                    continue
-                try:
-                    event = json.loads(line)
-                    if (event.get('payload', {}).get('type') == 'token_count' and
-                        event.get('payload', {}).get('rate_limits')):
-                        limits = event['payload']['rate_limits']
-                        _save_quota_cache(name, limits)
-                        return limits
-                except json.JSONDecodeError:
-                    continue
-    
+        except Exception:
+            continue
+
+        fallback_limits = None
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            limits = _extract_rate_limits_from_event(event)
+            if not isinstance(limits, dict):
+                continue
+
+            limit_id = limits.get('limit_id')
+            # Prefer the main Codex quota block over Spark/other model buckets.
+            if limit_id == 'codex':
+                _save_quota_cache(name, limits)
+                return limits
+
+            if fallback_limits is None:
+                fallback_limits = limits
+
+        if fallback_limits is not None:
+            _save_quota_cache(name, fallback_limits)
+            return fallback_limits
+
     # No fresh rate_limits - try cached data
     cached = _load_quota_cache(name)
     if cached:
         return cached
-    
+
     return None
 
 def cmd_auto(json_mode=False):
@@ -742,6 +791,72 @@ def cmd_auto(json_mode=False):
                 else:
                     reset_dt = datetime.fromtimestamp(resets_at).strftime("%b %d %H:%M")
                     print(f"   {name}: {act:.0f}% used (resets {reset_dt}){marker}")
+
+
+
+def cmd_ensure(min_daily_remaining=2.0, min_weekly_remaining=2.0, max_cache_age_hours=6, json_mode=False):
+    """
+    Switch only if active account is below thresholds.
+    Thresholds are in percent REMAINING (not used).
+    """
+    import time
+
+    ensure_dirs()
+
+    active_name, _email = resolve_active_profile()
+    if not active_name:
+        # If active auth.json isn't a saved snapshot yet, try to sync it into snapshots.
+        sync_current_login_to_snapshot()
+        active_name, _email = resolve_active_profile()
+
+    if not active_name:
+        if json_mode:
+            print(json.dumps({"error": "active account is not a saved snapshot"}, indent=2))
+        else:
+            print("❌ Active auth.json is not a saved snapshot; run: ./codex-accounts.py add")
+        return
+
+    # Prefer cached quota for active account
+    limits = _load_quota_cache(active_name, max_age_hours=max_cache_age_hours)
+    if not limits:
+        # Refresh quota for the active account (will ping codex + parse sessions)
+        limits = _get_quota_for_account(active_name)
+
+    if not limits:
+        if json_mode:
+            print(json.dumps({"error": "could not read quota for active account", "active": active_name}, indent=2))
+        else:
+            print(f"❌ Could not read quota for active account: {active_name}")
+        return
+
+    now = int(time.time())
+    daily_used = float(limits["primary"]["used_percent"])
+    weekly_used = float(limits["secondary"]["used_percent"])
+    weekly_resets_at = int(limits["secondary"].get("resets_at", 0) or 0)
+
+    effective_weekly_used = 0.0 if (weekly_resets_at and now >= weekly_resets_at) else weekly_used
+
+    daily_remaining = 100.0 - daily_used
+    weekly_remaining = 100.0 - effective_weekly_used
+
+    need_switch = (daily_remaining < min_daily_remaining) or (weekly_remaining < min_weekly_remaining)
+
+    if not need_switch:
+        if json_mode:
+            print(json.dumps({
+                "active": active_name,
+                "switched": False,
+                "daily_remaining": daily_remaining,
+                "weekly_remaining": weekly_remaining,
+            }, indent=2))
+        else:
+            print(f"✅ OK: {active_name} (daily {daily_remaining:.0f}% left, weekly {weekly_remaining:.0f}% left)")
+        return
+
+    # Switch to best account
+    if not json_mode:
+        print(f"⚠️ Low quota on {active_name} (daily {daily_remaining:.0f}% left, weekly {weekly_remaining:.0f}% left) -> switching...")
+    cmd_auto(json_mode=json_mode)
 
 def cmd_use(name):
     ensure_dirs()
@@ -881,6 +996,12 @@ def main():
     auto_parser = subparsers.add_parser("auto", help="Switch to the account with most quota available")
     auto_parser.add_argument("--json", action="store_true", help="Output as JSON")
 
+    ensure_parser = subparsers.add_parser("ensure", help="Switch only if active account is below thresholds")
+    ensure_parser.add_argument("--min-daily-remaining", type=float, default=2.0)
+    ensure_parser.add_argument("--min-weekly-remaining", type=float, default=2.0)
+    ensure_parser.add_argument("--max-cache-age-hours", type=int, default=6)
+    ensure_parser.add_argument("--json", action="store_true")
+
     args = parser.parse_args()
 
     # Always persist the currently active login back into its named snapshot.
@@ -894,6 +1015,13 @@ def main():
         cmd_save(args.name, force=bool(getattr(args, "force", False)))
     elif args.command == "auto":
         cmd_auto(json_mode=bool(getattr(args, "json", False)))
+    elif args.command == "ensure":
+        cmd_ensure(
+            min_daily_remaining=float(getattr(args, "min_daily_remaining", 2.0)),
+            min_weekly_remaining=float(getattr(args, "min_weekly_remaining", 2.0)),
+            max_cache_age_hours=int(getattr(args, "max_cache_age_hours", 6)),
+            json_mode=bool(getattr(args, "json", False)),
+        )
     else:
         cmd_list(
             verbose=bool(getattr(args, "verbose", False)),
